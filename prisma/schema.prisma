@@ -1,0 +1,293 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  // Руководитель отдела продаж — видит и редактирует только сотрудников и
+  // логи своего отдела (User.department), без доступа к настройкам KPI и
+  // без права добавлять/удалять сотрудников.
+  ROP
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String
+  role         Role     @default(MANAGER)
+  // Отделы, к которым привязан пользователь с ролью ROP (Розница /
+  // Колл-центр / Детский отдел, любое подмножество) — совпадают со значением
+  // Employee.department. Не используется для ADMIN/MANAGER (видят все
+  // отделы). Пустой массив = ROP без доступа ни к одному отделу.
+  departments  String[] @default([])
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@map("users")
+}
+
+model Employee {
+  id           String     @id @default(cuid())
+  fullName     String     @map("full_name")
+  email        String?
+  position     String     @default("Продавец-консультант")
+  department   String     @default("Розница") // Розница (1 этаж) / Колл-центр / Детский отдел (позже)
+  hireDate     String?    @map("hire_date")
+  active       Boolean    @default(true)
+  createdAt    DateTime   @default(now()) @map("created_at")
+  logEntries   LogEntry[]
+  monthlyPlans MonthlyPlan[]
+  daysOff      DayOff[]
+  dailyDebts   EmployeeDailyDebt[]
+  kpiMetricEntries KpiMetricEntry[]
+
+  @@map("employees")
+}
+
+enum LogType {
+  UPSELL
+  COMPLAINT
+  DISCIPLINE
+  REFERRAL
+}
+
+enum ComplaintKind {
+  REVIEW
+  COMPLAINT
+}
+
+// Дневная запись в журнале контроля. Заполняется вручную менеджером
+// (source = null) либо автоматически из внешнего источника, например
+// Telegram-бота, который ежедневно тянет продажи из UMAG
+// (source = "umag-daily") — тогда (employeeId, date, source) уникальны,
+// чтобы повторный прогон синхронизации обновлял запись, а не дублировал.
+model LogEntry {
+  id                String         @id @default(cuid())
+  type              LogType
+  date              String // YYYY-MM-DD
+  employeeId        String         @map("employee_id")
+  employee          Employee       @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  notes             String?
+  source            String? // null = ручной ввод; "umag-daily" = авто-синхронизация из UMAG
+  // upsell fields
+  // UMAG: полная сумма продаж, включая долговые/частично оплаченные
+  // накладные. EmployeeDailyDebt — справочный остаток, не добавлять сюда.
+  salesAmount       Int?           @map("sales_amount")
+  customersServed   Int?           @map("customers_served")
+  successfulUpsells Int?           @map("successful_upsells")
+  sevenSteps        Boolean?       @map("seven_steps")
+  // Сколько из обслуженных клиентов (customersServed) получили полное
+  // обслуживание — отмечается отдельной галочкой на каждого в UI (N штук,
+  // где N = customersServed), а не одной галочкой на всю запись.
+  fullServiceCount  Int?           @map("full_service_count")
+  // Причины отклонений — почему конкретный обслуженный клиент (индекс в
+  // FullServiceRating) НЕ получил полное обслуживание. Ключи — строковые
+  // индексы ("0","1",...), значения — текст причины. Заполняется по
+  // правому клику на конкретной иконке-крестике.
+  fullServiceReasons Json?         @map("full_service_reasons")
+  // complaint fields
+  kind              ComplaintKind?
+  // discipline fields
+  violationType     String?        @map("violation_type")
+  fine              Int?
+  // referral fields
+  count             Int?
+  createdAt         DateTime       @default(now()) @map("created_at")
+
+  @@unique([employeeId, date, source, type], name: "employeeId_date_source_type")
+  @@index([employeeId])
+  @@index([type])
+  @@index([date])
+  @@map("log_entries")
+}
+
+// Помесячный план продаж — либо личный (employeeId), либо общий по отделу
+// целиком (department, тот же баннер "Общая выручка Розница/Детский отдел"). Ровно
+// одно из двух полей заполнено. Нет строки на месяц = план не задан (0),
+// планы прошлых месяцев не меняются при правке текущего.
+model MonthlyPlan {
+  id         String    @id @default(cuid())
+  monthKey   String    @map("month_key") // YYYY-MM
+  employeeId String?   @map("employee_id")
+  employee   Employee? @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  department String? // задано только для плана отдела целиком (Розница/Детский отдел)
+  amount     Int       @default(0)
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  @@unique([monthKey, employeeId])
+  @@unique([monthKey, department])
+  @@index([monthKey])
+  @@map("monthly_plans")
+}
+
+// Выходной день конкретного сотрудника — исключается из знаменателя при
+// пропорциональном делении месячного плана на выбранный период (Дашборд),
+// чтобы отклонение за короткий период не выглядело как «провал» из-за
+// дня, когда сотрудник не должен был продавать. Отмечается только ADMIN
+// (см. requireAdmin() в plans/actions.ts).
+model DayOff {
+  id         String   @id @default(cuid())
+  employeeId String   @map("employee_id")
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  date       String // YYYY-MM-DD
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@unique([employeeId, date])
+  @@index([employeeId])
+  @@map("days_off")
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+}
+
+// История изменений записей журнала контроля (LogEntry) — кто, когда и что
+// изменил. Не связано FK-ключом с LogEntry: запись аудита должна пережить
+// удаление самой записи (иначе теряется след того, кто её удалил).
+// before/after — снимки затронутых полей (не всей записи целиком) в JSON.
+model AuditLog {
+  id         String      @id @default(cuid())
+  logEntryId String      @map("log_entry_id")
+  action     AuditAction
+  userId     String?     @map("user_id")
+  userName   String      @map("user_name")
+  before     Json?
+  after      Json?
+  createdAt  DateTime    @default(now()) @map("created_at")
+
+  @@index([logEntryId])
+  @@map("audit_logs")
+}
+
+// Ежедневная выручка по точке UMAG целиком (не по сотрудникам) — тот же
+// расчёт, что и Settings.totalRevenueActual/kidsOnlineActual (все каналы,
+// включая неоплаченные продажи, совпадает с отчётом UMAG "Прибыль/убытки"),
+// но по дням, а не только "месяц-к-дате". Позволяет "Общей выручке" на
+// Дашборде поддерживать выбор произвольного периода. department — то же
+// значение, что и Employee.department (Розница/Детский отдел), не название точки
+// UMAG напрямую. Обновляется daily_sync.py ежедневно.
+model StoreDailyRevenue {
+  id         String   @id @default(cuid())
+  department String
+  date       String // YYYY-MM-DD
+  amount     Int      @default(0)
+  // Сумма неоплаченных продаж ("Осталось" в UMAG) в составе amount за этот
+  // день -- amount включает их (совпадает с "Выручкой" в отчёте UMAG
+  // "Прибыль/убытки"), а debtAmount позволяет посчитать "чистую" выручку
+  // (amount - debtAmount) без долга. Обновляется daily_sync.py.
+  debtAmount Int      @default(0) @map("debt_amount")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([department, date])
+  @@index([date])
+  @@map("store_daily_revenue")
+}
+
+// Ежедневный долг (неоплаченные продажи) по КОНКРЕТНОМУ сотруднику — та же
+// сумма, что входит в StoreDailyRevenue.debtAmount по отделу целиком, но
+// разбита по продавцу через тег "Продавцы" в UMAG (см. debts_by_seller() в
+// боте). Долг продаж без тега продавца (например, онлайн-канал/не
+// привязанные к продавцу) сюда не попадает — остаётся видимым на дашборде
+// как разница между суммой по сотрудникам и общим debtAmount за период.
+// Обновляется daily_sync.py.
+model EmployeeDailyDebt {
+  id         String   @id @default(cuid())
+  employeeId String   @map("employee_id")
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  department String
+  date       String // YYYY-MM-DD
+  amount     Int      @default(0)
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([employeeId, date])
+  @@index([date])
+  @@map("employee_daily_debt")
+}
+
+// Строки долгов за день по точке — «кто должен и сколько осталось»: у
+// продавцов, чьи долги сворачиваются (см. AGGREGATED_DEBT_SELLERS в боте),
+// одна строка с коротким именем («Сардор К»), у остальных — по контрагенту.
+// Те же строки, что в «Отчёте для WhatsApp» кассового сайта. Обновляется
+// полной синхронизацией бота (full_sync.py).
+model StoreDailyDebt {
+  id         String   @id @default(cuid())
+  department String
+  date       String // YYYY-MM-DD
+  name       String
+  amount     Int      @default(0)
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([department, date, name])
+  @@index([date])
+  @@map("store_daily_debt")
+}
+
+model Settings {
+  id               String @id @default("singleton")
+  base             Int    @default(35)
+  discipline       Int    @default(15)
+  personal         Int    @default(30)
+  upsell           Int    @default(10)
+  quality          Int    @default(10)
+  // Факт по общей выручке Розница — тянется ботом напрямую из UMAG за всю
+  // точку "Розница" целиком (без привязки к продавцам), тот же принцип,
+  // что и kidsOnlineActual ниже. Обновляется daily_sync.py. Планы теперь
+  // помесячные (см. MonthlyPlan), эти поля — только месяц-к-дате факт.
+  totalRevenueActual Int  @default(0) @map("total_revenue_actual")
+  // Факт по общей выручке Детский отдел — тянется ботом напрямую из UMAG за всю
+  // точку "Kids" целиком (без привязки к продавцам), поэтому включает и
+  // продажи, не разнесённые по сотрудникам. НЕ совпадает с суммой личных
+  // продаж 4 сотрудников Детский отдел (та отдельно показана в карточке «Общие
+  // продажи») — это два независимых числа. Обновляется daily_sync.py,
+  // здесь не редактируется вручную.
+  kidsOnlineActual Int   @default(0) @map("kids_online_actual")
+  // Сколько дней назад не-ADMIN (MANAGER/ROP) ещё может добавлять/менять/
+  // удалять записи журналов (LogEntry.date). 0 = без ограничения. ADMIN
+  // это ограничение не касается. См. requireEditableLogDate() в
+  // src/lib/require-auth.ts.
+  editBackdateLimitDays Int @default(0) @map("edit_backdate_limit_days")
+
+  @@map("settings")
+}
+
+// Additional personal-result goals. Their weight is reserved from personal,
+// so employees outside their scope keep the existing KPI calculation.
+model KpiMetric {
+  id          String @id @default(cuid())
+  name        String
+  dailyTarget Int @map("daily_target")
+  weight      Int
+  departments String[]
+  startsOn    String @map("starts_on")
+  endsOn      String? @map("ends_on")
+  createdAt   DateTime @default(now()) @map("created_at")
+  entries     KpiMetricEntry[]
+
+  @@map("kpi_metrics")
+}
+
+model KpiMetricEntry {
+  id         String @id @default(cuid())
+  metricId   String @map("metric_id")
+  metric     KpiMetric @relation(fields: [metricId], references: [id], onDelete: Restrict)
+  employeeId String @map("employee_id")
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  date       String
+  amount     Int
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([metricId, employeeId, date])
+  @@index([employeeId, date])
+  @@map("kpi_metric_entries")
+}
